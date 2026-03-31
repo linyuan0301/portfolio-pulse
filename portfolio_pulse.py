@@ -1,297 +1,227 @@
-#!/usr/bin/env python3
 """
-Portfolio Pulse — Real-time terminal portfolio tracker
-
-Install dependencies:
-    pip install yfinance rich plotext
-
-Usage:
-    python portfolio_pulse.py                # default 30-second refresh
-    python portfolio_pulse.py --refresh 60   # custom interval
+Portfolio Pulse — 终端投资组合看板
+一杯咖啡的时间，看清自己的钱在哪里
 """
 
-# ── HOLDINGS ──────────────────────────────────────────────────────────────────
-# Edit this dict to match your actual positions: {ticker: number_of_shares}
-HOLDINGS: dict[str, float] = {
-    "AAPL":  10,
-    "MSFT":   5,
-    "NVDA":   8,
-    "BRK-B":  3,
-    "GOOGL":  4,
-}
-# ─────────────────────────────────────────────────────────────────────────────
-
-import argparse
-import sys
 import time
 from datetime import datetime
-from typing import Optional
 
-try:
-    import pandas as pd
-    import yfinance as yf
-    import plotext as plt
-    from rich.live import Live
-    from rich.layout import Layout
-    from rich.table import Table
-    from rich.panel import Panel
-    from rich.text import Text
-    from rich.console import Console
-    from rich import box
-except ImportError as e:
-    print(f"Missing dependency: {e}")
-    print("Install with:  pip install yfinance rich plotext")
-    sys.exit(1)
+import yfinance as yf
+from rich.align import Align
+from rich.console import Console
+from rich.layout import Layout
+from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+
+# ── 在这里改你的持仓，随时手动调 ────────────────────────────────
+HOLDINGS = {
+    'AAPL':  {'shares': 10, 'avg_cost': 150.0},
+    'MSFT':  {'shares': 5,  'avg_cost': 320.0},
+    'GOOGL': {'shares': 3,  'avg_cost': 140.0},
+    'TSLA':  {'shares': 8,  'avg_cost': 200.0},
+    'SPY':   {'shares': 4,  'avg_cost': 450.0},
+}
+# ─────────────────────────────────────────────────────────────────
+
+REFRESH_INTERVAL = 30   # 多少秒刷一次，改成 60 也没问题
+BAR_TOTAL_CHARS  = 20   # 横条总宽（字符），调大调小随意
 
 console = Console()
 
-# ── Price cache ───────────────────────────────────────────────────────────────
-_cache: dict[str, dict] = {}   # ticker → {price, prev_close, day_change_pct}
-_last_fetch: Optional[float] = None
-_fetch_failed = False
-# ─────────────────────────────────────────────────────────────────────────────
+# 横条里的实心/空心字符，换成别的也行
+BLOCK_FILLED = "█"
+BLOCK_EMPTY  = "░"
+
+# 每只票用不同颜色，纯粹好看
+TICKER_COLORS = ["cyan", "magenta", "yellow", "green", "blue", "red", "white"]
 
 
-def fetch_prices() -> bool:
-    """Batch-fetch latest prices via yfinance. Returns True on success."""
-    global _cache, _last_fetch, _fetch_failed
-    tickers = list(HOLDINGS.keys())
-    try:
-        raw = yf.download(
-            tickers,
-            period="2d",
-            auto_adjust=True,
-            progress=False,
-            threads=True,
-        )
-
-        if raw.empty:
-            _fetch_failed = True
-            return False
-
-        # Normalize: single-ticker download returns a Series for "Close"
-        close = raw["Close"]
-        if isinstance(close, pd.Series):
-            close = close.to_frame(name=tickers[0])
-
-        updated_any = False
-        for ticker in tickers:
-            if ticker not in close.columns:
-                continue
-            col = close[ticker].dropna()
-            if col.empty:
-                continue
-            price = float(col.iloc[-1])
-            prev  = float(col.iloc[-2]) if len(col) >= 2 else price
-            pct   = (price - prev) / prev * 100 if prev else 0.0
-            _cache[ticker] = {
-                "price":         price,
-                "prev_close":    prev,
-                "day_change_pct": pct,
-            }
-            updated_any = True
-
-        if not updated_any:
-            _fetch_failed = True
-            return False
-
-        _last_fetch   = time.time()
-        _fetch_failed = False
-        return True
-
-    except Exception:
-        _fetch_failed = True
-        return False
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _total_mv() -> float:
-    return sum(
-        _cache[t]["price"] * HOLDINGS[t]
-        for t in HOLDINGS if t in _cache
+def fetch_prices(tickers: list[str]) -> dict[str, float]:
+    """
+    批量拉当前价格，yfinance 走 1d/1m 数据
+    市场关闭的时候会返回最后收盘价，延迟 15 分钟，凑合用
+    """
+    raw = yf.download(
+        tickers,
+        period="1d",
+        interval="1m",
+        progress=False,
+        auto_adjust=True,
     )
+    prices: dict[str, float] = {}
+
+    if len(tickers) == 1:
+        # 单只票的时候 yfinance 返回的 DataFrame 列名没有 ticker，单独处理
+        try:
+            prices[tickers[0]] = float(raw["Close"].dropna().iloc[-1])
+        except Exception:
+            prices[tickers[0]] = 0.0
+    else:
+        for t in tickers:
+            try:
+                prices[t] = float(raw["Close"][t].dropna().iloc[-1])
+            except Exception:
+                prices[t] = 0.0  # 拉不到就用 0，总比崩了强
+
+    return prices
 
 
-# ── UI builders ───────────────────────────────────────────────────────────────
+# ── UI 组件 ──────────────────────────────────────────────────────
 
-def build_header_panel(seconds_left: int) -> Panel:
-    mv       = _total_mv() or 1.0
-    pnl      = sum(
-        (_cache[t]["price"] - _cache[t]["prev_close"]) * HOLDINGS[t]
-        for t in HOLDINGS if t in _cache
+def build_header(refresh_time: str) -> Panel:
+    """顶部标题栏，显示名字和上次刷新时间"""
+    content = Align.center(
+        Text(
+            f"📈  Portfolio Pulse  ·  最后刷新：{refresh_time}  ·  每 {REFRESH_INTERVAL}s 自动更新",
+            style="bold white",
+        ),
+        vertical="middle",
     )
-    prev_tot = mv - pnl
-    pct      = (pnl / prev_tot * 100) if prev_tot else 0.0
-
-    pnl_style = "bold green" if pnl >= 0 else "bold red"
-    sign      = "+" if pnl >= 0 else ""
-    ts        = (
-        datetime.fromtimestamp(_last_fetch).strftime("%H:%M:%S")
-        if _last_fetch else "—"
-    )
-
-    left = Text(no_wrap=True)
-    left.append("Total  ", style="bold")
-    left.append(f"${mv:>12,.2f}", style="bold cyan")
-    left.append("    Day P&L  ", style="bold")
-    left.append(f"{sign}${pnl:,.2f}  ({sign}{pct:.2f}%)", style=pnl_style)
-    left.append(f"    Updated {ts}", style="dim")
-    if _fetch_failed:
-        left.append("   ⚠ Price fetch failed, showing cached data", style="bold yellow")
-
-    right = Text(justify="right", no_wrap=True)
-    right.append(f"Next refresh in {seconds_left:>3}s", style="dim")
-
-    grid = Table.grid(expand=True, padding=0)
-    grid.add_column(ratio=4)
-    grid.add_column(justify="right", ratio=1)
-    grid.add_row(left, right)
-
-    return Panel(
-        grid,
-        title="[bold blue]◈ Portfolio Pulse[/bold blue]",
-        box=box.ROUNDED,
-        padding=(0, 1),
-    )
+    return Panel(content, style="on dark_blue", height=3)
 
 
-def build_table_panel() -> Panel:
-    mv_total = _total_mv() or 1.0
-
-    tbl = Table(
-        box=box.SIMPLE_HEAVY,
+def build_holdings_table(prices: dict[str, float]) -> tuple[Panel, float, float, float]:
+    """
+    持仓明细表格
+    同时返回 (Panel, 总市值, 总盈亏金额, 总盈亏%)
+    """
+    table = Table(
         show_header=True,
-        header_style="bold white",
+        header_style="bold cyan",
+        border_style="bright_black",
         expand=True,
-        show_edge=False,
-    )
-    tbl.add_column("Ticker",        style="bold cyan",  min_width=8)
-    tbl.add_column("Shares",        justify="right",    min_width=8)
-    tbl.add_column("Price",         justify="right",    min_width=12)
-    tbl.add_column("Market Value",  justify="right",    min_width=14)
-    tbl.add_column("% Portfolio",   justify="right",    min_width=12)
-    tbl.add_column("Day Change%",   justify="right",    min_width=12)
-
-    for ticker, shares in HOLDINGS.items():
-        if ticker not in _cache:
-            tbl.add_row(ticker, f"{shares:g}", "—", "—", "—", "—")
-            continue
-
-        d        = _cache[ticker]
-        price    = d["price"]
-        mv       = price * shares
-        pct_port = mv / mv_total * 100
-        day_pct  = d["day_change_pct"]
-
-        day_style = "bold green" if day_pct >= 0 else "bold red"
-        day_sign  = "+" if day_pct >= 0 else ""
-
-        tbl.add_row(
-            ticker,
-            f"{shares:g}",
-            f"${price:>10,.2f}",
-            f"${mv:>12,.2f}",
-            f"{pct_port:>6.1f}%",
-            Text(f"{day_sign}{day_pct:.2f}%", style=day_style),
-        )
-
-    return Panel(
-        tbl,
-        title="[bold]Holdings[/bold]",
-        box=box.ROUNDED,
         padding=(0, 1),
     )
+    table.add_column("Ticker",  style="bold white", justify="center", min_width=7)
+    table.add_column("股数",     justify="right",    min_width=6)
+    table.add_column("成本价",   justify="right",    min_width=9)
+    table.add_column("现价",     justify="right",    min_width=9)
+    table.add_column("市值",     justify="right",    min_width=12)
+    table.add_column("盈亏金额", justify="right",    min_width=12)
+    table.add_column("盈亏%",   justify="right",    min_width=9)
 
+    total_market = 0.0
+    total_cost   = 0.0
 
-def build_chart_panel(width: int, height: int) -> Panel:
-    entries = [
-        (t, HOLDINGS[t] * _cache[t]["price"])
-        for t in HOLDINGS if t in _cache
-    ]
-    if not entries:
-        return Panel(
-            "Waiting for price data…",
-            title="[bold]Portfolio Allocation[/bold]",
-            box=box.ROUNDED,
+    for ticker, info in HOLDINGS.items():
+        shares   = info["shares"]
+        avg_cost = info["avg_cost"]
+        price    = prices.get(ticker, 0.0)
+
+        mv      = shares * price
+        cost    = shares * avg_cost
+        pnl     = mv - cost
+        pnl_pct = (pnl / cost * 100) if cost else 0.0
+
+        total_market += mv
+        total_cost   += cost
+
+        color    = "green" if pnl >= 0 else "red"
+        sign     = "+" if pnl >= 0 else ""
+
+        table.add_row(
+            ticker,
+            str(shares),
+            f"${avg_cost:.2f}",
+            f"${price:.2f}",
+            f"${mv:,.2f}",
+            Text(f"{sign}${pnl:,.2f}", style=color),
+            Text(f"{sign}{pnl_pct:.2f}%", style=color),
         )
 
-    labels = [t for t, _ in entries]
-    values = [v for _, v in entries]
+    total_pnl     = total_market - total_cost
+    total_pnl_pct = (total_pnl / total_cost * 100) if total_cost else 0.0
 
-    try:
-        plt.clear_figure()
-        plt.plot_size(max(20, width - 4), max(8, height - 2))
-        plt.pie(values, labels=labels)
-        plt.title("Portfolio Allocation")
-        chart_str = plt.build()
-        content: object = Text.from_ansi(chart_str)
-    except Exception as exc:
-        content = Text(f"Chart unavailable: {exc}", style="dim")
+    # 底部汇总行，直接拼文字加在 Panel 标题里
+    pnl_color = "green" if total_pnl >= 0 else "red"
+    pnl_sign  = "+" if total_pnl >= 0 else ""
+    subtitle  = (
+        f"[bold white]总市值 [bold yellow]${total_market:,.2f}[/bold yellow]"
+        f"   总盈亏 [{pnl_color}]{pnl_sign}${total_pnl:,.2f}  ({pnl_sign}{total_pnl_pct:.2f}%)[/{pnl_color}][/bold white]"
+    )
+    panel = Panel(table, title="[bold cyan]持仓明细[/bold cyan]", subtitle=subtitle, border_style="bright_black")
 
-    return Panel(
-        content,
-        title="[bold]Portfolio Allocation[/bold]",
-        box=box.ROUNDED,
-        padding=0,
+    return panel, total_market, total_pnl, total_pnl_pct
+
+
+def build_bar_chart(prices: dict[str, float], total_market: float) -> Panel:
+    """
+    用 block characters 拼伪饼图（其实是横向比例条）
+    AAPL  ████████████░░░░  32.4%
+    就这风格，简单直接
+    """
+    lines = Text()
+
+    for i, (ticker, info) in enumerate(HOLDINGS.items()):
+        price = prices.get(ticker, 0.0)
+        mv    = info["shares"] * price
+        pct   = (mv / total_market * 100) if total_market else 0.0
+
+        filled = round(pct / 100 * BAR_TOTAL_CHARS)
+        empty  = BAR_TOTAL_CHARS - filled
+        bar    = BLOCK_FILLED * filled + BLOCK_EMPTY * empty
+
+        color = TICKER_COLORS[i % len(TICKER_COLORS)]
+
+        lines.append(f"  {ticker:<6}", style="bold white")
+        lines.append(f" {bar} ", style=color)
+        lines.append(f" {pct:5.1f}%\n", style="white")
+
+    return Panel(lines, title="[bold]权重分布[/bold]", border_style="bright_black", padding=(1, 2))
+
+
+def make_layout(prices: dict[str, float], refresh_time: str) -> Layout:
+    """把所有模块组装成 Layout，交给 Live 渲染"""
+    header                                     = build_header(refresh_time)
+    holdings_panel, total_mv, total_pnl, total_pnl_pct = build_holdings_table(prices)
+    chart_panel                                = build_bar_chart(prices, total_mv)
+
+    layout = Layout()
+    layout.split_column(
+        Layout(header,         name="header",  size=3),
+        Layout(name="body"),
+    )
+    layout["body"].split_row(
+        Layout(holdings_panel, name="holdings", ratio=3),
+        Layout(chart_panel,    name="chart",    ratio=2),
     )
 
-
-def build_root(seconds_left: int) -> Layout:
-    h = console.height
-    w = console.width
-
-    chart_h = max(14, h // 3)
-
-    root = Layout()
-    root.split_column(
-        Layout(name="header", size=3),
-        Layout(name="table"),
-        Layout(name="chart", size=chart_h),
-    )
-
-    root["header"].update(build_header_panel(seconds_left))
-    root["table"].update(build_table_panel())
-    root["chart"].update(build_chart_panel(w, chart_h))
-
-    return root
+    return layout
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+# ── 主循环 ───────────────────────────────────────────────────────
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Portfolio Pulse — real-time terminal portfolio tracker"
-    )
-    parser.add_argument(
-        "--refresh",
-        type=int,
-        default=30,
-        metavar="SECONDS",
-        help="Refresh interval in seconds (default: 30, minimum: 5)",
-    )
-    args     = parser.parse_args()
-    interval = max(5, args.refresh)
+    tickers = list(HOLDINGS.keys())
 
-    console.print("[bold blue]Portfolio Pulse[/bold blue] — fetching initial prices…")
-    fetch_prices()
-    next_refresh = time.time() + interval
+    # 启动时先拉一次数据，别直接进 Live 显示一堆 0
+    console.print("[bold cyan]Portfolio Pulse 启动中...[/bold cyan]")
+    console.print(f"[dim]正在拉取 {', '.join(tickers)} 的行情数据...[/dim]\n")
 
-    with Live(console=console, screen=True, refresh_per_second=2) as live:
+    prices       = fetch_prices(tickers)
+    refresh_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    last_fetch   = time.time()
+
+    with Live(make_layout(prices, refresh_time), refresh_per_second=2, screen=True) as live:
         while True:
-            now          = time.time()
-            seconds_left = max(0, int(next_refresh - now))
-            live.update(build_root(seconds_left))
+            time.sleep(1)
 
-            if now >= next_refresh:
-                fetch_prices()
-                next_refresh = time.time() + interval
+            now = time.time()
+            if now - last_fetch >= REFRESH_INTERVAL:
+                try:
+                    prices       = fetch_prices(tickers)
+                    refresh_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    last_fetch   = now
+                except Exception:
+                    pass  # 网络抽风就用上次缓存的，佛系
 
-            time.sleep(0.5)
+            live.update(make_layout(prices, refresh_time))
 
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        console.print("\n[dim]Goodbye.[/dim]")
+        console.print("\n[bold green]Goodbye！[/bold green]\n")

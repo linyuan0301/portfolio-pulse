@@ -1,3 +1,2 @@
 yfinance
 rich
-pandas
