@@ -1,2 +1,4 @@
-yfinance
 rich
+yfinance
+plotext
+pandas

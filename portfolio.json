@@ -1,0 +1,9 @@
+{
+  "holdings": [
+    {"symbol": "AAPL",    "shares": 10,   "avg_cost": 150.0},
+    {"symbol": "BTC-USD", "shares": 0.5,  "avg_cost": 40000.0},
+    {"symbol": "TSLA",    "shares": 5,    "avg_cost": 200.0},
+    {"symbol": "QQQ",     "shares": 8,    "avg_cost": 380.0}
+  ],
+  "refresh_interval": 30
+}
